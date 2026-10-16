@@ -1,5 +1,6 @@
 //===- StageCostModels.cpp - Per-stage analytical models -----------------===//
 
+#include "AscendModel/RouteModel/Reduction/ReductionCostModel.h"
 #include "AscendModel/RouteModel/StageCostModels.h"
 #include "AscendModel/RouteModel/Models/IndirectGatherMemoryCostModel.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -1224,6 +1225,7 @@ static void mapCompositeDotPaths(StageWorkload &work,
 static std::optional<StageResourceCycles>
 mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
             StageMode mode, int64_t superblockFactor, bool wholeSimt,
+            std::optional<double> calibratedReduction = std::nullopt,
             StageMemoryCost fitted = {}) {
   StageResourceCycles resources;
   // Accesses priced by the closed-form strided-direct mechanism.  The masked
@@ -2216,6 +2218,9 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         std::max(0.0, resources.predicate -
                           instructions / profile.predicateOperationsPerCycle);
   }
+  if (calibratedReduction) {
+    resources.reduction = *calibratedReduction;
+  } else {
   const double simdReductionStartupOwners =
       std::min(1.0, std::max(0.0, work.reductionOperations));
   resources.reduction =
@@ -2402,6 +2407,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           startupCurve->second,
           static_cast<int64_t>(std::ceil(work.shuffleLaneSteps)));
   }
+  }
   if (work.dotFlops > 0.0) {
     // A Stage can own multiple tiny dots.
     resources.dot = work.dotOperations * profile.dotSetupCycles +
@@ -2468,6 +2474,72 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
   mapMaskedStridedCopyCompletion(stage, work, profile, resources,
                                  stridedShortAlreadyClaimed);
   return materializeControlFlow(stage, mode, resources, profile.controlFlow);
+}
+
+// The calibration prices one reduction window, not an entire Stage body.
+static std::optional<StageResourceCycles>
+mapOrdinaryTailReduction(const LogicalStage &stage,
+                         const StageImplementation &implementation,
+                         const HardwareProfile &hardware,
+                         const StageModeProfile &modeProfile,
+                         const StageResourceCycles &legacy) {
+  if (!hardware.reductionProfile || !stage.reductionExternalWorkload ||
+      implementation.aivSubblocks != 1 ||
+      stage.costModelKind != StageCostModelKind::RowwiseReduction ||
+      legacy.rowwiseReductionGroupBody > 0.0 ||
+      legacy.multiResultReductionGroupBody > 0.0 ||
+      !stage.workload.scalarizedMultiResultReductionCounts.empty() ||
+      !stage.workload.oneTripMaskedAccumulatorReductionExtents.empty() ||
+      stage.workload.reductionWorkloads.empty() ||
+      !stage.workload.prefixScanCounts.empty())
+    return std::nullopt;
+  double occurrences = 0.0, cycles = 0.0;
+  const ReductionMode mode = implementation.mode == StageMode::SIMD
+                                 ? ReductionMode::SIMD : ReductionMode::SIMT;
+  for (const auto &work : stage.workload.reductionWorkloads) {
+    // Prove an ordinary row-major load with the complete operand shape.
+    bool contiguous = false;
+    for (const auto &access : stage.workload.memoryAccesses) {
+      if (access.store || access.shape != work.shape ||
+          access.strides.size() != work.shape.size() ||
+          access.addressDependsOnLoadedIndex ||
+          access.addressHasNonAffineTensorComputation ||
+          access.addressHasTensorControlFlowSelection || access.masked)
+        continue;
+      int64_t stride = 1;
+      bool valid = true;
+      for (size_t i = work.shape.size(); i-- > 0;) {
+        valid &= access.strides[i] && *access.strides[i] == stride;
+        if (work.shape[i] <= 0 || stride > INT64_MAX / work.shape[i]) {
+          valid = false;
+          break;
+        }
+        stride *= work.shape[i];
+      }
+      contiguous |= valid;
+    }
+    if (!contiguous)
+      return std::nullopt;
+    auto cost = estimateTailAxisReductionCycles(
+        work, hardware.reductionProfile->getModeProfile(mode), mode,
+        hardware.baseSimtWarpCount);
+    if (!cost || !std::isfinite(*cost) || *cost < 0.0)
+      return std::nullopt;
+    cycles += work.instances * *cost;
+    occurrences += work.instances;
+  }
+  if (!std::isfinite(cycles) ||
+      std::abs(occurrences - stage.workload.reductionOperations) > 1e-9)
+    return std::nullopt;
+  LogicalStage external = stage;
+  external.workload = *stage.reductionExternalWorkload;
+  // Keep the candidate's execution domain. The fitted window prices one
+  // logical program; applySuperBlock owns the physical-group composition.
+  return mapWorkload(
+      external, modeProfile, implementation.mode,
+      implementation.superblockFactor,
+      implementation.mode == StageMode::SIMT && !implementation.localScope,
+      cycles);
 }
 
 /// Balanced CV tensor partition on one AIV.
@@ -3898,11 +3970,16 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
           executionStage, modeProfile, implementation.mode,
           implementation.superblockFactor,
           implementation.mode == StageMode::SIMT && !implementation.localScope,
-          fitted);
+          std::nullopt, fitted);
       if (!resources)
         continue;
+      auto calibrated = mapOrdinaryTailReduction(
+          executionStage, implementation, profile, modeProfile, *resources);
+      if (calibrated)
+        resources = *calibrated;
       StageImplementationCost cost;
       cost.implementation = implementation;
+      cost.calibratedTailReduction = calibrated.has_value();
       cost.resources = *resources;
       if (fitted.load)
         cost.indirectLoadPricing = implementation.mode == StageMode::SIMD
@@ -3974,6 +4051,8 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
       if (!stage.workload.segmentedIndirectStoreCounts.empty() &&
           resources->indirectMemoryAnalyticalFallback)
         cost.formulaEvidence += "+segmented_indirect_store_analytical_fallback";
+      if (calibrated)
+        cost.formulaEvidence += "+calibrated_tail_reduction_window";
       if (resources->scalarizedMultiResultReduction > 0.0)
         cost.formulaEvidence += "+scalarized_multi_result_reduction_surface";
       if (resources->multiResultReductionGroupBody > 0.0)

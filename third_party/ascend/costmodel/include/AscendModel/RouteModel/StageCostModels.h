@@ -9,6 +9,7 @@
 #define ASCENDMODEL_ROUTEMODEL_STAGECOSTMODELS_H
 
 #include "AscendModel/RouteModel/StageRouteCostModel.h"
+#include "AscendModel/RouteModel/Reduction/ReductionProfile.h"
 
 #include "AscendModel/RouteModel/Models/StridedShortCostModel.h"
 
@@ -75,6 +76,8 @@ struct LogicalStage {
   int64_t iterationCount = 1;
   StageModelFeatures features;
   StageWorkload workload;
+  /// Same traversal excluding reduce combine bodies; preserves external work.
+  std::optional<StageWorkload> reductionExternalWorkload;
   /// Exact TTIR ownership when StagePartition was built from an operation
   /// graph.
   std::vector<Operation *> operations;
@@ -537,6 +540,7 @@ class IndirectMemoryParameters;
 
 struct HardwareProfile {
   std::shared_ptr<const IndirectMemoryParameters> indirectMemoryParameters;
+  std::optional<ReductionProfile> reductionProfile;
   std::string profileVersion;
   std::string target;
   /// Explicit opt-in to a target-specific random-address, matched-ALU fit.
