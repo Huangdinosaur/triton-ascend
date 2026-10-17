@@ -1830,7 +1830,8 @@ HardwareProfile tailMigrationProfile() {
   return profile;
 }
 LogicalStage ordinaryTailStage() {
-  auto stage = logicalStage("ordinary_tail", StageCostModelKind::RowwiseReduction);
+  auto stage =
+      logicalStage("ordinary_tail", StageCostModelKind::RowwiseReduction);
   stage.features.hasReduction = true;
   stage.workload.reductionOperations = 1;
   stage.workload.shuffleLaneSteps = 64 * 6;
@@ -1851,11 +1852,13 @@ TEST(SimdSimtCostModelTest, OrdinaryTailUsesFrozenFormulaAndRecomputesPath) {
   auto stage = ordinaryTailStage();
   auto expected = mlir::ascend::estimateTailAxisReductionCycles(
       stage.workload.reductionWorkloads.front(),
-      profile.reductionProfile->getModeProfile(mlir::ascend::ReductionMode::SIMD),
+      profile.reductionProfile->getModeProfile(
+          mlir::ascend::ReductionMode::SIMD),
       mlir::ascend::ReductionMode::SIMD, 4);
   ASSERT_TRUE(expected);
   auto table = evaluateOneStage(stage, profile);
-  ASSERT_TRUE(static_cast<bool>(table)) << (table ? "" : llvm::toString(table.takeError()));
+  ASSERT_TRUE(static_cast<bool>(table))
+      << (table ? "" : llvm::toString(table.takeError()));
   bool found = false;
   for (const auto &cost : table->stages.front().implementations) {
     if (cost.implementation.mode != StageMode::SIMD)
@@ -1879,7 +1882,8 @@ TEST(SimdSimtCostModelTest, TailCalibrationPreservesCandidateExecutionDomain) {
   stage.localSimtFactors = {1, 2, 4};
   auto expected = mlir::ascend::estimateTailAxisReductionCycles(
       stage.workload.reductionWorkloads.front(),
-      profile.reductionProfile->getModeProfile(mlir::ascend::ReductionMode::SIMT),
+      profile.reductionProfile->getModeProfile(
+          mlir::ascend::ReductionMode::SIMT),
       mlir::ascend::ReductionMode::SIMT, profile.baseSimtWarpCount);
   ASSERT_TRUE(expected);
   auto table = evaluateOneStage(stage, profile);
@@ -1917,8 +1921,10 @@ TEST(SimdSimtCostModelTest, TailUnsupportedOrSpecialLayoutPreservesLegacy) {
     ASSERT_TRUE(static_cast<bool>(baseline));
     ASSERT_EQ(changed->stages.front().implementations.size(),
               baseline->stages.front().implementations.size());
-    for (size_t i = 0; i < changed->stages.front().implementations.size(); ++i) {
-      EXPECT_FALSE(changed->stages.front().implementations[i].calibratedTailReduction);
+    for (size_t i = 0; i < changed->stages.front().implementations.size();
+         ++i) {
+      EXPECT_FALSE(
+          changed->stages.front().implementations[i].calibratedTailReduction);
       EXPECT_DOUBLE_EQ(changed->stages.front().implementations[i].totalCycles,
                        baseline->stages.front().implementations[i].totalCycles);
     }

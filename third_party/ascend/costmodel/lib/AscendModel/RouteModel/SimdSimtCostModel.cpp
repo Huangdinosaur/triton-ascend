@@ -2215,8 +2215,9 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
   if (const auto *value = root->get("reduction_profile")) {
     auto reference = value->getAsString();
     if (!reference || reference->empty())
-      return llvm::createStringError(std::errc::invalid_argument,
-                                     "reduction_profile must be a nonempty path");
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "reduction_profile must be a nonempty path");
     const std::string resolved = resolveProfileReference(path, *reference);
     if (dependencies)
       dependencies->push_back(resolved);
@@ -3010,9 +3011,10 @@ loadCandidateProfileUncached(llvm::StringRef pathRef,
   if (hardware.reductionProfile) {
     std::string assets = profile.contentSha256 + "\nreduction=" +
                          hardware.reductionProfile->getContentHash().str();
-    profile.contentSha256 = llvm::toHex(llvm::SHA256::hash(
-        llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(assets.data()),
-                                assets.size())), true);
+    profile.contentSha256 = llvm::toHex(
+        llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
+            reinterpret_cast<const uint8_t *>(assets.data()), assets.size())),
+        true);
   }
   return profile;
 }

@@ -1,8 +1,8 @@
 //===- StagePartitioner.cpp - Build semantic Stage IR -------------------===//
 
-#include "AscendModel/RouteModel/Reduction/ReductionAnalysis.h"
 #include "AscendModel/Analysis/StagePartitioner.h"
 #include "AscendModel/Analysis/StageMemoryPatternAnalysis.h"
+#include "AscendModel/RouteModel/Reduction/ReductionAnalysis.h"
 #include "ascend/include/Utils/SuperBlockFactor.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -2105,7 +2105,8 @@ inferRuntimeGridStrideIterations(const LogicalStage &stage,
 }
 
 static void mergeWorkload(StageWorkload &into, StageWorkload from) {
-  llvm::append_range(into.reductionWorkloads, std::move(from.reductionWorkloads));
+  llvm::append_range(into.reductionWorkloads,
+                     std::move(from.reductionWorkloads));
   for (auto field : workloadScalarFields)
     into.*field += from.*field;
   into.memoryAccesses.insert(into.memoryAccesses.end(),

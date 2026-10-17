@@ -519,6 +519,7 @@ struct StageResourceCycles {
 
 struct StageImplementationCost {
   bool calibratedTailReduction = false;
+  bool calibratedFirstReduction = false;
   StageImplementation implementation;
   std::string indirectLoadPricing = "generic_resource_model";
   std::string indirectStorePricing = "generic_resource_model";
