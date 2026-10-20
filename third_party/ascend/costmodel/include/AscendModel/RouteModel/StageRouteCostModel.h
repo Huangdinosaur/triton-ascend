@@ -520,6 +520,9 @@ struct StageResourceCycles {
 struct StageImplementationCost {
   bool calibratedTailReduction = false;
   bool calibratedFirstReduction = false;
+  bool calibratedMiddleReduction = false;
+  double reductionFallbackInstances = 0;
+  std::map<std::string, double> fittedReductionInstances;
   StageImplementation implementation;
   std::string indirectLoadPricing = "generic_resource_model";
   std::string indirectStorePricing = "generic_resource_model";

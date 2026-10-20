@@ -13,6 +13,7 @@ add_mlir_library(AscendModelRouteModel
   Reduction/ReductionWorkload.cpp
   Reduction/ReductionProfile.cpp
   Reduction/ReductionCostModel.cpp
+  Reduction/ReductionLayoutModel.cpp
   StageCostModels.cpp
   Models/IndirectGatherMemoryCostModel.cpp
   Models/IndirectMemoryChainCostModel.cpp
