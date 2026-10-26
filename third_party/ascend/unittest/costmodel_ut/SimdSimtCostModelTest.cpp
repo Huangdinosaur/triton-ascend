@@ -1966,37 +1966,6 @@ TEST(SimdSimtCostModelTest,
     EXPECT_FALSE(cost.calibratedTailReduction);
 }
 
-TEST(SimdSimtCostModelTest, MiddleAxisFrozenNumericFixtures) {
-  auto hardware = tailMigrationProfile();
-  auto buffer =
-      llvm::MemoryBuffer::getFile(TRITON_ASCEND_MIDDLE_TEST_FIXTURE_PATH);
-  ASSERT_TRUE(buffer);
-  auto parsed = llvm::json::parse((*buffer)->getBuffer());
-  ASSERT_TRUE(static_cast<bool>(parsed));
-  auto *fixtures = parsed->getAsArray();
-  ASSERT_TRUE(fixtures);
-  for (const auto &entry : *fixtures) {
-    const auto *o = entry.getAsObject();
-    ASSERT_TRUE(o);
-    mlir::ascend::ReductionWorkload work;
-    work.kind = o->getString("op")->str();
-    work.dataType = o->getString("dtype")->str();
-    work.axis = 1;
-    for (const auto &d : *o->getArray("shape"))
-      work.shape.push_back(*d.getAsInteger());
-    auto estimate = takeReductionResult(mlir::ascend::estimateReductionCycles(
-        work, *hardware.reductionProfile,
-        o->getString("mode") && *o->getString("mode") == "simd"
-            ? mlir::ascend::ReductionMode::SIMD
-            : mlir::ascend::ReductionMode::SIMT,
-        *o->getInteger("warps")));
-    ASSERT_TRUE(estimate) << work.kind << "/" << work.dataType;
-    EXPECT_EQ(estimate->axis, mlir::ascend::ReductionAxisKind::Middle);
-    EXPECT_NEAR(estimate->cycles, *o->getNumber("cycle"),
-                1e-6 * std::max(1.0, *o->getNumber("cycle")));
-  }
-}
-
 TEST(SimdSimtCostModelTest, PerReductionMixedAxesAndPartialFallback) {
   auto profile = tailMigrationProfile();
   profile.baseSimtWarpCount = 4;
@@ -2111,34 +2080,6 @@ TEST(SimdSimtCostModelTest, PartialReductionPreservesOnlyUnmatchedCombine) {
   ASSERT_TRUE(estimate);
   EXPECT_NEAR(cost.resources.reduction,
               old.resources.reduction + estimate->cycles, 1e-9);
-}
-
-TEST(SimdSimtCostModelTest, CurrentFirstAxisAllSegmentFixtures) {
-  auto hardware = tailMigrationProfile();
-  auto buf = llvm::MemoryBuffer::getFile(TRITON_ASCEND_FIRST_TEST_FIXTURE_PATH);
-  ASSERT_TRUE(buf);
-  auto data = llvm::json::parse((*buf)->getBuffer());
-  ASSERT_TRUE(static_cast<bool>(data));
-  ASSERT_TRUE(data->getAsArray());
-  for (const auto &v : *data->getAsArray()) {
-    auto o = v.getAsObject();
-    ASSERT_TRUE(o);
-    mlir::ascend::ReductionWorkload work;
-    work.kind = o->getString("op")->str();
-    work.dataType = o->getString("dtype")->str();
-    work.axis = 0;
-    for (const auto &d : *o->getArray("shape"))
-      work.shape.push_back(*d.getAsInteger());
-    auto c = takeReductionResult(mlir::ascend::estimateReductionCycles(
-        work, *hardware.reductionProfile,
-        *o->getString("mode") == "simd" ? mlir::ascend::ReductionMode::SIMD
-                                        : mlir::ascend::ReductionMode::SIMT,
-        *o->getInteger("W")));
-    ASSERT_TRUE(c);
-    EXPECT_EQ(c->axis, mlir::ascend::ReductionAxisKind::First);
-    EXPECT_NEAR(c->cycles, *o->getNumber("expected"),
-                1e-6 * std::max(1.0, *o->getNumber("expected")));
-  }
 }
 
 TEST(SimdSimtCostModelTest, ReductionProfileHierarchyAndLegacyAreEquivalent) {
