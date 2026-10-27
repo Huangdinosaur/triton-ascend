@@ -2499,7 +2499,8 @@ mapOrdinaryReduction(const LogicalStage &stage,
                      const StageImplementation &implementation,
                      const HardwareProfile &hardware,
                      const StageModeProfile &modeProfile,
-                     const StageResourceCycles &legacy) {
+                     const StageResourceCycles &legacy,
+                     const StageMemoryCost &fitted) {
   if (!hardware.reductionProfile || !stage.reductionExternalWorkload ||
       implementation.aivSubblocks != 1 ||
       stage.costModelKind != StageCostModelKind::RowwiseReduction ||
@@ -2584,7 +2585,7 @@ mapOrdinaryReduction(const LogicalStage &stage,
                             implementation.superblockFactor,
                             implementation.mode == StageMode::SIMT &&
                                 !implementation.localScope,
-                            cycles);
+                            cycles, fitted);
   if (!mapped)
     return std::nullopt;
   result.resources = *mapped;
@@ -4022,8 +4023,9 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
           std::nullopt, fitted);
       if (!resources)
         continue;
-      auto mapping = mapOrdinaryReduction(executionStage, implementation,
-                                          profile, modeProfile, *resources);
+      auto mapping =
+          mapOrdinaryReduction(executionStage, implementation, profile,
+                               modeProfile, *resources, fitted);
       if (!mapping)
         return mapping.takeError();
       const auto &calibrated = *mapping;

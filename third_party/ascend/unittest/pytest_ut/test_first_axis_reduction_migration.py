@@ -13,7 +13,9 @@ def test_axis_calibration_and_legacy_fallback(tmp_path, axis, expected, load_str
     profiles = Path(__file__).resolve().parents[2] / "costmodel" / "profiles"
     source = profiles / "simd_simt" / "ascend_950pr_simd_simt_v1.json"
     selection = json.loads(source.read_text())
-    selection["microbenchmark_profile"] = str((source.parent / selection["microbenchmark_profile"]).resolve())
+    for key in ("microbenchmark_profile", "indirect_memory_profile"):
+        if key in selection:
+            selection[key] = str((source.parent / selection[key]).resolve())
     reduction = json.loads((source.parent / selection["reduction_profile"]).read_text())
     dependency = tmp_path / "reduction.json"
     dependency.write_text(json.dumps(reduction))

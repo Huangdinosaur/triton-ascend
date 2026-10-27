@@ -2041,9 +2041,10 @@ static void accumulateDynamicOperationTree(
     if (reductions) {
       StageWorkload contribution;
       auto ignored = estimates;
-      accumulateDynamicOperationTree(
-          operation, contribution, multiplicity, fallbackLoopTripCount, ignored,
-          logicalProgramCountHint, mappedTensor, false, nullptr, memoryPatterns);
+      accumulateDynamicOperationTree(operation, contribution, multiplicity,
+                                     fallbackLoopTripCount, ignored,
+                                     logicalProgramCountHint, mappedTensor,
+                                     false, nullptr, memoryPatterns);
       reductions->push_back(std::move(contribution));
     }
   }
@@ -3461,12 +3462,15 @@ llvm::Error StageWorkloadAnalysis::analyze(
           false, &stage.reductionContributions, memoryPatterns);
     StageWorkload external;
     external.paysKernelSetup = work.paysKernelSetup;
+    // Ordinary fitted reductions remove only pure combine work; their external
+    // memory operations retain the same static address descriptions.
+    external.addressPatterns = work.addressPatterns;
     auto ignoredFeatures = stage.features;
     for (Operation *root : stage.operations)
       accumulateDynamicOperationTree(
           root, external, semanticRootEntryMultiplicity(root),
-          fallbackLoopTripCount, ignoredFeatures, logicalProgramCountHint, {}, true,
-          nullptr, memoryPatterns);
+          fallbackLoopTripCount, ignoredFeatures, logicalProgramCountHint, {},
+          true, nullptr, memoryPatterns);
     scaleWorkload(external, 1.0 / std::max<int64_t>(1, stage.iterationCount));
     stage.reductionExternalWorkload = std::move(external);
     for (auto &contribution : stage.reductionContributions)

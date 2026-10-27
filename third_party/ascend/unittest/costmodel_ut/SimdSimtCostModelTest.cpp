@@ -1,6 +1,8 @@
 #include "AscendModel/RouteModel/SimdSimtCostModel.h"
+#include "AscendModel/Analysis/StageMemoryPatternAnalysis.h"
 #include "AscendModel/Analysis/StagePartitioner.h"
 #include "AscendModel/RouteModel/StageCostModels.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include <array>
 #include <thread>
 
@@ -78,8 +80,6 @@ HardwareProfile hardwareProfile(ScopeHandoffCost scopeHandoff = {}) {
     mode.predicateOperationsPerCycle = 1.0;
     mode.reductionLaneStepsPerCycle = 1.0;
     mode.shuffleLanesPerCycle = 32.0;
-    mode.reductionLaneStepsPerCycle = 32.0;
-    mode.prefixScanStepLatencyCycles = 1.0;
     mode.dotSetupCycles = 8.0;
     mode.dotFlopsPerCycle = 64.0;
     mode.issueOperationsPerCycle = 4.0;
@@ -1832,6 +1832,8 @@ template <typename T> T takeReductionResult(llvm::Expected<T> result) {
 }
 HardwareProfile tailMigrationProfile() {
   auto profile = hardwareProfile();
+  profile.simd.reductionLaneStepsPerCycle = 32.0;
+  profile.simt.reductionLaneStepsPerCycle = 32.0;
   auto path = std::string(TRITON_ASCEND_SIMD_SIMT_TEST_PROFILE_PATH);
   path = path.substr(0, path.find_last_of('/')) +
          "/../reduction/david_v100_reduction_v1.json";
@@ -2439,4 +2441,78 @@ TEST(SimdSimtCostModelTest, LazyReductionConcurrentErrorIsStable) {
   for (const auto &error : errors)
     EXPECT_EQ(error, errors[0]);
   EXPECT_EQ(p->getParsedFunctionCount(), 0u);
+}
+
+TEST(SimdSimtCostModelTest, ReductionExternalSnapshotPreservesMemoryPatterns) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::triton::TritonDialect>();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(R"(
+    module { tt.func @probe(%x: !tt.ptr<f32>, %y: !tt.ptr<f32>) {
+      %r = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32>
+      %p = tt.splat %x : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+      %a = tt.addptr %p, %r : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+      %v = tt.load %a : tensor<64x!tt.ptr<f32>>
+      %s = "tt.reduce"(%v) ({
+        ^bb0(%lhs: f32, %rhs: f32):
+          %sum = arith.addf %lhs, %rhs : f32
+          tt.reduce.return %sum : f32
+      }) {axis = 0 : i32} : (tensor<64xf32>) -> f32
+      tt.store %y, %s : !tt.ptr<f32>
+      tt.return
+    } })",
+                                                        &context);
+  ASSERT_TRUE(module);
+  StagePartition partition;
+  partition.operationOwnershipComplete = true;
+  auto stage = logicalStage("reduction_with_memory",
+                            StageCostModelKind::RowwiseReduction);
+  module->walk([&](mlir::triton::FuncOp function) {
+    for (mlir::Operation &operation : function.getBody().front())
+      if (!operation.hasTrait<mlir::OpTrait::IsTerminator>())
+        stage.operations.push_back(&operation);
+  });
+  partition.stages.push_back(std::move(stage));
+  mlir::ascend::StageMemoryPatternAnalysis patterns(*module);
+  if (auto error = StageWorkloadAnalysis().analyze(partition, 8, &patterns))
+    FAIL() << llvm::toString(std::move(error));
+  bool found = false;
+  for (const auto &stage : partition.stages) {
+    if (stage.workload.reductionWorkloads.empty())
+      continue;
+    found = true;
+    ASSERT_TRUE(stage.reductionExternalWorkload);
+    ASSERT_FALSE(stage.workload.addressPatterns.empty());
+    EXPECT_EQ(stage.workload.addressPatterns.size(),
+              stage.reductionExternalWorkload->addressPatterns.size());
+    EXPECT_EQ(stage.workload.memoryAccesses.size(),
+              stage.reductionExternalWorkload->memoryAccesses.size());
+    EXPECT_EQ(stage.reductionContributions.size(), 1u);
+    EXPECT_DOUBLE_EQ(stage.reductionExternalWorkload->reductionOperations, 0);
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST(SimdSimtCostModelTest, ReductionRemappingPreservesStridedShortCompletion) {
+  auto profile = tailMigrationProfile();
+  auto stage = ordinaryTailStage();
+  stage.workload.memoryAccesses.front().strides = {2};
+  stage.workload.loadBytes = 256;
+  stage.workload.continuousLoadCounts[{256, 32}] = 1;
+  stage.reductionExternalWorkload = stage.workload;
+  mlir::ascend::StridedShortCompletionFit fit;
+  fit.intercept = 123;
+  fit.evidence = "unit-test";
+  profile.simd.stridedShortCompletionFits["simd_load_stride2_r1"] = fit;
+  auto fitted = evaluateOneStage(stage, profile);
+  profile.reductionProfile.reset();
+  auto baseline = evaluateOneStage(stage, profile);
+  ASSERT_TRUE(static_cast<bool>(fitted));
+  ASSERT_TRUE(static_cast<bool>(baseline));
+  const auto &cost = fitted->stages.front().implementations.front();
+  const auto &old = baseline->stages.front().implementations.front();
+  ASSERT_EQ(cost.implementation.mode, StageMode::SIMD);
+  EXPECT_TRUE(cost.calibratedTailReduction);
+  EXPECT_GT(cost.resources.load, 0);
+  EXPECT_DOUBLE_EQ(cost.resources.load, old.resources.load);
 }
