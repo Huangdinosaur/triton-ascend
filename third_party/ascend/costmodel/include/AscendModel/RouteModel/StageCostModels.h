@@ -8,14 +8,20 @@
 #ifndef ASCENDMODEL_ROUTEMODEL_STAGECOSTMODELS_H
 #define ASCENDMODEL_ROUTEMODEL_STAGECOSTMODELS_H
 
+#include "AscendModel/RouteModel/Reduction/ReductionProfile.h"
 #include "AscendModel/RouteModel/StageRouteCostModel.h"
+
+#include "AscendModel/RouteModel/Models/StridedShortCostModel.h"
 
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
+#include <array>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +42,7 @@ enum class StageCostModelKind {
   PredicateMask,
   LoopPredicate,
   ContinuousTileMemory,
+  PartialContinuousTileMemory,
   ContinuousTileStore,
   ContinuousShortLoad,
   CachePolicyStore,
@@ -62,6 +69,8 @@ struct StageControlFlowRates {
   bool isFiniteAndNonNegative() const;
 };
 
+void mergeReductionResidualWorkload(StageWorkload &into, StageWorkload from);
+
 struct LogicalStage {
   std::string id;
   StageCostModelKind costModelKind = StageCostModelKind::ScalarIssue;
@@ -69,6 +78,11 @@ struct LogicalStage {
   int64_t iterationCount = 1;
   StageModelFeatures features;
   StageWorkload workload;
+  /// Work outside reduce roots and their nested regions, normalized per
+  /// iteration.
+  std::optional<StageWorkload> reductionExternalWorkload;
+  // Full per-reduce root and combine contributions, normalized per iteration.
+  std::vector<StageWorkload> reductionContributions;
   /// Exact TTIR ownership when StagePartition was built from an operation
   /// graph.
   std::vector<Operation *> operations;
@@ -296,6 +310,8 @@ struct StageModeProfile {
   /// SIMD scalar-row store groups indexed by row stride in bytes.
   std::map<int64_t, PipelinedStridedStoreGroupCost>
       pipelinedStridedStoreGroupsByRowStrideBytes;
+  std::map<std::string, StridedShortCompletionFit>
+      stridedShortCompletionFits; // key: stringifyStridedShortFormula(slot)
   /// Directional completion floors for masked FP32 strided copies.  The key
   /// is the physical byte stride of the strided side.
   std::map<int64_t, MaskedStridedCopyCompletionCost>
@@ -525,9 +541,24 @@ struct StageModeProfile {
   bool isValid(StageMode mode) const;
 };
 
+class IndirectMemoryParameters;
+
 struct HardwareProfile {
+  std::shared_ptr<const IndirectMemoryParameters> indirectMemoryParameters;
+  std::optional<ReductionProfile> reductionProfile;
   std::string profileVersion;
   std::string target;
+  /// Explicit opt-in to a target-specific random-address, matched-ALU fit.
+  /// The dtype model selects by storage width, not integer/floating names;
+  /// the INT32-only identifier is retained for old-profile reproducibility.
+  /// Empty retains the legacy transaction model.
+  std::string simtIndirectLoadModel;
+  /// FP32 scalar-loop matched-address differential, random-address prior.
+  std::string simdIndirectLoadModel;
+  /// Random store A/B fits. Empty retains legacy transactions. Store state is
+  /// an explicit profile prior; reuse additionally requires workload evidence.
+  std::string simtIndirectStoreModel;
+  std::string simdIndirectStoreModel;
   /// Base warp count of one logical SIMT program.
   int64_t baseSimtWarpCount = 1;
   /// CV1:2 work partition, applied before local SuperBlock grouping. This is

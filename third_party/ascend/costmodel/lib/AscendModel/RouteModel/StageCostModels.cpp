@@ -1,6 +1,11 @@
 //===- StageCostModels.cpp - Per-stage analytical models -----------------===//
 
 #include "AscendModel/RouteModel/StageCostModels.h"
+#include "AscendModel/RouteModel/Models/IndirectGatherMemoryCostModel.h"
+#include "mlir/IR/BuiltinTypes.h"
+
+#include "AscendModel/RouteModel/Models/StridedShortCostModel.h"
+#include "AscendModel/RouteModel/Reduction/ReductionCostModel.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
@@ -15,8 +20,10 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <system_error>
 #include <type_traits>
 
@@ -249,10 +256,237 @@ accessShape(const StageMemoryAccess &access) {
   return std::make_pair(*elements * elementBytes, *elements);
 }
 
-static void mapMaskedStridedCopyCompletion(const LogicalStage &stage,
-                                           const StageWorkload &work,
-                                           const StageModeProfile &profile,
-                                           StageResourceCycles &resources) {
+static int64_t stridedElementAddress(const StridedAddressStats &stats,
+                                     int64_t flat) {
+  if (stats.cols <= 0)
+    return flat * stats.innerStrideBytes;
+  const int64_t row = flat / stats.cols;
+  const int64_t col = flat % stats.cols;
+  return row * stats.rowPitchBytes + col * stats.innerStrideBytes;
+}
+
+StridedAddressStats
+describeStridedShortAddresses(const StageMemoryAccess &access,
+                              llvm::ArrayRef<int64_t> windows) {
+  StridedAddressStats stats;
+  auto shape = accessShape(access);
+  if (!shape || access.elementBits <= 0 || access.elementBits % 8 != 0)
+    return stats;
+  stats.elementBytes = access.elementBits / 8;
+  stats.elements = shape->second;
+  // A rank-one access has exactly one shape axis; the rank-two geometry below
+  // is the only part that needs a second axis.  Requiring two axes here would
+  // reject the whole rank-one half of the calibrated domain.
+  if (stats.elements <= 0 || access.shape.empty() ||
+      access.strides.size() < access.shape.size())
+    return stats;
+
+  if (access.effectiveRank() <= 1) {
+    stats.rows = 1;
+    stats.cols = stats.elements;
+    // A trailing singleton axis has stride 0, so take the pitch from the axis
+    // that actually varies.
+    int64_t innerStride = 0;
+    for (size_t axis = 0; axis < access.shape.size(); ++axis)
+      if (access.shape[axis] > 1 && access.strides[axis] &&
+          (innerStride == 0 || *access.strides[axis] < innerStride))
+        innerStride = *access.strides[axis];
+    stats.innerStrideBytes =
+        innerStride > 0 ? innerStride * stats.elementBytes : stats.elementBytes;
+    stats.rowPitchBytes = 0;
+  } else {
+    if (access.shape.size() < 2)
+      return stats;
+    stats.rows = access.shape[0];
+    stats.cols = access.shape[1];
+    stats.innerStrideBytes = !access.strides[1]
+                                 ? stats.elementBytes
+                                 : *access.strides[1] * stats.elementBytes;
+    stats.rowPitchBytes =
+        !access.strides[0] ? 0 : *access.strides[0] * stats.elementBytes;
+  }
+  if (stats.innerStrideBytes <= 0 || stats.cols <= 0)
+    return stats;
+  stats.spanBytes =
+      (stats.elements - 1) * stats.innerStrideBytes + stats.elementBytes;
+
+  for (int64_t window : windows) {
+    if (window <= 0)
+      continue;
+    std::map<int64_t, int64_t> counts;
+    std::map<int64_t, std::set<int64_t>> blockRows;
+    std::map<int64_t, std::map<int64_t, int64_t>> perRowCounts;
+    for (int64_t flat = 0; flat < stats.elements; ++flat) {
+      const int64_t address = stridedElementAddress(stats, flat);
+      const int64_t block = address / window;
+      const int64_t row = stats.cols > 0 ? flat / stats.cols : 0;
+      ++counts[block];
+      blockRows[block].insert(row);
+      ++perRowCounts[block][row];
+    }
+    int64_t maximum = 0;
+    int64_t squares = 0;
+    int64_t rowBlocksTotal = 0;
+    int64_t shared = 0;
+    int64_t maxRow = 0;
+    for (const auto &entry : counts) {
+      maximum = std::max(maximum, entry.second);
+      squares += entry.second * entry.second;
+      rowBlocksTotal += static_cast<int64_t>(blockRows[entry.first].size());
+      if (blockRows[entry.first].size() >= 2)
+        ++shared;
+      for (const auto &rowEntry : perRowCounts[entry.first])
+        maxRow = std::max(maxRow, rowEntry.second);
+    }
+    stats.maxPerBlock[window] = maximum;
+    stats.sumSquaresPerBlock[window] = squares;
+    stats.distinctBlocks[window] = static_cast<int64_t>(counts.size());
+    stats.rowBlocksSum[window] = rowBlocksTotal;
+    stats.sharedBlocks[window] = shared;
+    stats.maxPerRowBlock[window] = maxRow;
+  }
+
+  {
+    std::map<int64_t, std::set<int64_t>> linesPerKilo;
+    std::map<int64_t, std::set<int64_t>> rowsPerKilo;
+    for (int64_t flat = 0; flat < stats.elements; ++flat) {
+      const int64_t address = stridedElementAddress(stats, flat);
+      linesPerKilo[address / 1024].insert(address / 128);
+      rowsPerKilo[address / 1024].insert(stats.cols > 0 ? flat / stats.cols
+                                                        : 0);
+    }
+    for (const auto &entry : linesPerKilo)
+      stats.maxConc1k =
+          std::max(stats.maxConc1k, static_cast<int64_t>(entry.second.size()));
+    for (const auto &entry : rowsPerKilo)
+      stats.maxRowsPerKilo = std::max(
+          stats.maxRowsPerKilo, static_cast<int64_t>(entry.second.size()));
+  }
+
+  const int64_t waves = llvm::divideCeil(stats.elements, int64_t(32));
+  if (waves > 0) {
+    int64_t total = 0;
+    for (int64_t wave = 0; wave < waves; ++wave) {
+      std::set<int64_t> lines;
+      for (int64_t lane = 0; lane < 32; ++lane) {
+        const int64_t flat = wave * 32 + lane;
+        if (flat >= stats.elements)
+          break;
+        lines.insert(stridedElementAddress(stats, flat) / 128);
+      }
+      total += static_cast<int64_t>(lines.size());
+    }
+    stats.meanWarpLines =
+        static_cast<double>(total) / static_cast<double>(waves);
+  }
+  return stats;
+}
+
+/// Claim the StridedShort direct accesses of one Stage with the closed-form
+/// completion formulas, recording the usual receipts so the analytical
+/// fallback does not price the same bytes twice.
+///
+/// Guards:
+///   * StridedShort - the calibrated layout class.
+///   * masked       - admitted, except a SIMD store, which pays a destination
+///                    read-back and therefore has its own two slots.
+///   * no sync      - a synchronised Stage is not the measured pipeline.
+///
+/// A straight-line Stage is admissible too: the fits are per-iteration slopes,
+/// which stay defined without a loop to amortise them over.
+static void mapStridedShortMemoryCompletion(
+    const LogicalStage &stage, const StageWorkload &work,
+    const StageModeProfile &profile, StageResourceCycles &resources, bool simd,
+    LayoutCoverage &layout, std::vector<const StageMemoryAccess *> &claimed) {
+  if (profile.stridedShortCompletionFits.empty())
+    return;
+  if (stage.features.synchronizationCount != 0)
+    return;
+  // Static storage: binding an ArrayRef to a braced temporary is -Wdangling
+  // and the tree builds with -Werror.
+  static constexpr int64_t windowSizes[] = {64, 128, 256, 512, 1024};
+  const llvm::ArrayRef<int64_t> windows = windowSizes;
+  for (const StageMemoryAccess &access : work.memoryAccesses) {
+    if (access.count <= 0.0)
+      continue;
+    if (access.layoutClass() != StageMemoryAccess::LayoutClass::StridedShort)
+      continue;
+    // Masked accesses are admitted: the load and SIMT store fits were measured
+    // to be mask-invariant (the compaction form shows -0.6% masked versus
+    // unmasked), and the two SIMD store fits are masked-only slots, so no
+    // access can be priced by a fit that was swept under the other mask state.
+    if (!access.hasStaticLayout())
+      continue;
+    if (access.addressDependsOnLoadedIndex ||
+        access.addressHasNonAffineTensorComputation ||
+        access.addressHasTensorControlFlowSelection)
+      continue;
+    if (access.effectiveRank() > 2)
+      continue;
+    if (access.elementBits / 8 <= 0)
+      continue;
+    // describeStridedShortAddresses owns the element pitch, so both the domain
+    // check and the fit read the same number.
+    const auto stats = describeStridedShortAddresses(access, windows);
+    if (stats.elements <= 0)
+      continue;
+    // A unit inner stride is contiguous, not strided: that regime belongs to
+    // the wide/contiguous path, which these formulas do not describe.
+    if (stats.innerStrideBytes <= stats.elementBytes)
+      continue;
+    const auto shape = accessShape(access);
+    if (!shape)
+      continue;
+    // Geometry decides the slot; the mode is the only non-geometry input and
+    // travels as a bool, never as a name prefix.  This is the whole dispatch:
+    // a slot that owns this geometry is priced, and a geometry that no slot
+    // owns keeps the analytical fallback.
+    const auto formula = selectStridedShortFormula(access, stats, simd);
+    if (!formula)
+      continue;
+    auto fit = profile.stridedShortCompletionFits.find(
+        stringifyStridedShortFormula(*formula).str());
+    // Missing coefficients are missing data, not a reason to price the access
+    // with a different formula: skip it and let the fallback own the bytes.
+    if (fit == profile.stridedShortCompletionFits.end())
+      continue;
+    auto cycles = evaluateStridedShortCompletionFormula(
+        *formula, fit->second, stats, profile.activeWarpCount);
+    if (!cycles || *cycles <= 0.0)
+      continue;
+    const double total = *cycles * access.count;
+    const double warpInstructions =
+        access.count * llvm::divideCeil(shape->second, int64_t(32));
+    // Receipt for the masked strided copy mechanism: it must yield on any
+    // access this formula already priced, so the two mechanisms cannot both
+    // charge the same bytes.
+    claimed.push_back(&access);
+    if (access.store) {
+      resources.store += total;
+      layout.storeBytes += access.count * shape->first;
+      layout.storeOperations += access.count;
+      layout.storeWarpInstructions += warpInstructions;
+      resources.stridedShortStoreCompletion += total;
+    } else {
+      resources.load += total;
+      layout.loadBytes += access.count * shape->first;
+      layout.loadOperations += access.count;
+      layout.loadWarpInstructions += warpInstructions;
+      resources.stridedShortLoadCompletion += total;
+    }
+  }
+}
+
+/// The single string form of a slot: the profile JSON key.
+
+} // namespace
+
+namespace {
+
+static void mapMaskedStridedCopyCompletion(
+    const LogicalStage &stage, const StageWorkload &work,
+    const StageModeProfile &profile, StageResourceCycles &resources,
+    llvm::ArrayRef<const StageMemoryAccess *> claimed) {
   if (stage.costModelKind != StageCostModelKind::IndependentPipelinedLoop ||
       stage.features.synchronizationCount != 0 ||
       stage.features.conditionalBranchCount != 0 ||
@@ -308,6 +542,12 @@ static void mapMaskedStridedCopyCompletion(const LogicalStage &stage,
 
   const auto curve = curves->find(stridedAccess->rowStrideBytes());
   if (curve == curves->end())
+    return;
+  // A strided access already priced by the closed-form strided-direct
+  // mechanism yields this floor: otherwise both charge the same bytes, and the
+  // measured absolute cost says the closed form is the more accurate of the
+  // two.  Accesses it did not claim keep the floor exactly as before.
+  if (llvm::is_contained(claimed, stridedAccess))
     return;
   const auto floor =
       curve->second.evaluate(stridedAccess->rowCount(), stage.iterationCount);
@@ -984,15 +1224,28 @@ static void mapCompositeDotPaths(StageWorkload &work,
 
 static std::optional<StageResourceCycles>
 mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
-            StageMode mode, int64_t superblockFactor, bool wholeSimt) {
+            StageMode mode, int64_t superblockFactor, bool wholeSimt,
+            std::optional<double> calibratedReduction = std::nullopt,
+            StageMemoryCost fitted = {}) {
   StageResourceCycles resources;
+  // Accesses priced by the closed-form strided-direct mechanism.  The masked
+  // strided copy floor yields on them and stays in force for everything else.
+  std::vector<const StageMemoryAccess *> stridedShortAlreadyClaimed;
   StageWorkload work = stage.workload;
   if (wholeSimt)
     mapCompositeDotPaths(work, profile, superblockFactor, resources);
   const bool simd = mode == StageMode::SIMD;
   resources.setup = work.paysKernelSetup ? profile.setupCycles : 0.0;
-  if (simd)
-    mapSimdIrregularTileCompletion(work, profile, resources);
+  if (simd) {
+    StageWorkload completionWork = work;
+    if (fitted.nativeSimdEnvelope)
+      llvm::erase_if(completionWork.memoryAccesses,
+                     [&](const StageMemoryAccess &a) {
+                       return a.addressDependsOnLoadedIndex &&
+                              a.store == bool(fitted.store);
+                     });
+    mapSimdIrregularTileCompletion(completionWork, profile, resources);
+  }
   if (work.scalarLoadCount > 0.0)
     resources.load +=
         simd ? mainScalarLoadCycles(work.scalarLoadCount, profile)
@@ -1199,7 +1452,11 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         count * depth * profile.prefixScanStepLatencyCycles;
   }
   // Unclassified scalar operations have no execution-throughput evidence.
-  if (stage.features.hasIndirectMemory) {
+  // Mixed-axis classification does not replace #2528's resource pricing.
+  if (stage.features.hasIndirectMemory || fitted.load || fitted.store ||
+      stage.costModelKind == StageCostModelKind::PartialContinuousTileMemory ||
+      work.indirectLoadTransactions > 0.0 ||
+      work.indirectStoreTransactions > 0.0) {
     const double loads = work.loadWarpInstructions;
     const double stores = work.storeWarpInstructions;
     double curvedLoadBytes = 0.0;
@@ -1209,6 +1466,20 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
     double curvedStoreOperations = 0.0;
     double curvedStoreWarpInstructions = 0.0;
     double loadStartup = 0.0;
+    // Fits are target A/B increments, not whole-stage envelopes. Cover the
+    // target once and leave unrelated memory and helper resources untouched.
+    if (fitted.load) {
+      resources.load += *fitted.load;
+      curvedLoadBytes = work.indirectLoadBytes;
+      curvedLoadOperations = 1.0;
+      curvedLoadWarpInstructions = work.indirectLoadTransactions;
+    }
+    if (fitted.store) {
+      resources.store += *fitted.store;
+      curvedStoreBytes = work.indirectStoreBytes;
+      curvedStoreOperations = 1.0;
+      curvedStoreWarpInstructions = work.indirectStoreTransactions;
+    }
     std::map<std::tuple<int64_t, int64_t, int64_t>, double>
         coveredSegmentedLoadCounts;
     const auto factorLoad =
@@ -1261,6 +1532,8 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
             ? factorStartup->second
             : profile.indirectLoadStartupSystemCyclesByWarpInstructions;
     for (const auto &[shape, count] : work.segmentedIndirectLoadCounts) {
+      if (fitted.load)
+        break;
       const int64_t bytes = std::get<0>(shape);
       const int64_t elements = std::get<1>(shape);
       const int64_t contiguousElements = std::get<2>(shape);
@@ -1292,6 +1565,8 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       coveredSegmentedLoadCounts[shape] += count;
     }
     for (const auto &[shape, count] : work.indirectLoadCounts) {
+      if (fitted.load)
+        break;
       const int64_t bytes = shape.first;
       const int64_t elements = shape.second;
       const int64_t warpInstructions = llvm::divideCeil(elements, int64_t(32));
@@ -1330,7 +1605,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         resources.indirectLoadGroupStartup = loadStartup;
     }
     // Loaded-index stores are indexed by distinct destination segments.
-    if (!profile.indirectStoreSystemCyclesBySegments.empty()) {
+    if (!fitted.store && !profile.indirectStoreSystemCyclesBySegments.empty()) {
       auto priceStore = [&](int64_t bytes, int64_t elements,
                             int64_t contiguousElements, double count) {
         if (bytes != elements * 4 || elements <= 0 || contiguousElements <= 0)
@@ -1381,6 +1656,8 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           uncoveredLoadOperations * profile.loadOperationSetupCycles +
           uncoveredLoadBytes / profile.loadBytesPerCycle;
       for (const auto &[shape, count] : work.segmentedIndirectLoadCounts) {
+        if (fitted.load)
+          break;
         const int64_t elements = std::get<1>(shape);
         const int64_t contiguousElements = std::get<2>(shape);
         const int64_t segments = llvm::divideCeil(elements, contiguousElements);
@@ -1406,6 +1683,14 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
     const bool pipelinedSimd = simd && permitsSimdOverlap(stage) &&
                                stage.features.synchronizationCount == 0 &&
                                stage.features.conditionalBranchCount == 0;
+    // Runs before the load-group curve below, and before the masked-copy curve
+    // further down, so both can see which accesses this pass already priced.
+    mapStridedShortMemoryCompletion(stage, work, profile, resources, simd,
+                                    layout, stridedShortAlreadyClaimed);
+    // The store-group curve below must not price a store this pass already did.
+    const bool storesClaimedByClosedForm = std::any_of(
+        stridedShortAlreadyClaimed.begin(), stridedShortAlreadyClaimed.end(),
+        [](const StageMemoryAccess *access) { return access->store; });
     if (pipelinedSimd && profile.independentLoadGroupBytesPerCycle > 0.0) {
       std::vector<const StageMemoryAccess *> flatPrefix;
       bool reachedFirstLoad = false;
@@ -1473,7 +1758,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       }
     }
 
-    if (pipelinedSimd &&
+    if (pipelinedSimd && !storesClaimedByClosedForm &&
         !profile.pipelinedStridedStoreGroupsByRowStrideBytes.empty()) {
       double operations = 0.0;
       double bytes = 0.0;
@@ -1529,6 +1814,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
         }
       }
     }
+
     // GM count curves contain no FMA-to-store shared-memory exchange.
     std::map<const StageMemoryLayoutCost *, double> exchanges;
     if (!simd && isContinuousMemoryStage(stage.costModelKind))
@@ -1911,192 +2197,228 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
           count * instructions / profile.predicateOperationsPerCycle;
     }
   }
-  const double simdReductionStartupOwners =
-      std::min(1.0, std::max(0.0, work.reductionOperations));
-  resources.reduction =
-      simd && profile.reductionLaneStepsPerCycle > 0.0
-          ? simdReductionStartupOwners * profile.reductionOperationSetupCycles +
-                work.shuffleLaneSteps / profile.reductionLaneStepsPerCycle
-          : work.shuffleLaneSteps / profile.shuffleLanesPerCycle;
-  if (simd && profile.scalarizedMultiResultReductionMinimumExtent > 0 &&
-      profile.scalarizedMultiResultReductionReferenceResults > 0 &&
-      profile.scalarizedMultiResultReductionElementsPerCycle > 0.0) {
-    for (const auto &[shape, count] :
-         work.scalarizedMultiResultReductionCounts) {
-      const int64_t rows = std::get<0>(shape);
-      const int64_t extent = std::get<1>(shape);
-      const int64_t results = std::get<2>(shape);
-      const int64_t bits = std::get<3>(shape);
-      if (count <= 0.0 ||
-          extent < profile.scalarizedMultiResultReductionMinimumExtent ||
-          results < profile.scalarizedMultiResultReductionReferenceResults ||
-          bits != 32)
-        continue;
-      const double resultScale =
-          static_cast<double>(results) /
-          profile.scalarizedMultiResultReductionReferenceResults;
-      resources.scalarizedMultiResultReduction +=
-          count * (profile.scalarizedMultiResultReductionSetupCycles +
-                   static_cast<double>(rows) * extent * resultScale /
-                       profile.scalarizedMultiResultReductionElementsPerCycle);
+  if (simd && fitted.coveredPredicate) {
+    auto tensor =
+        cast<RankedTensorType>(fitted.coveredPredicate->getResult(0).getType());
+    double instructions =
+        std::ceil(double(tensor.getNumElements()) / profile.vectorWidth);
+    if (fullyDescribed(segmented.logicalElements.lookup("predicate.cmp"),
+                       predicateElements)) {
+      for (const auto &entry : work.tensorOperationWorkloads)
+        if (entry.operation == "predicate.cmp" &&
+            entry.logicalElements == tensor.getNumElements()) {
+          instructions = entry.segmentCount *
+                         std::ceil(double(entry.contiguousElementsPerSegment *
+                                          entry.elementBitWidth) /
+                                   profile.vectorWidthBits);
+          break;
+        }
     }
-    // The scalar loop is the concrete lowering of the same semantic reduction
-    // already priced above.
+    resources.predicate =
+        std::max(0.0, resources.predicate -
+                          instructions / profile.predicateOperationsPerCycle);
+  }
+  if (calibratedReduction && work.reductionOperations == 0.0) {
+    resources.reduction = *calibratedReduction;
+  } else {
+    const double simdReductionStartupOwners =
+        std::min(1.0, std::max(0.0, work.reductionOperations));
     resources.reduction =
-        std::max(resources.reduction, resources.scalarizedMultiResultReduction);
-  }
-  if (!simd && wholeSimt && superblockFactor == 1 &&
-      profile.multiResultReductionGroupBaseWarpCount > 0 &&
-      profile.activeWarpCount ==
-          profile.multiResultReductionGroupBaseWarpCount * superblockFactor &&
-      profile.multiResultReductionResultCount > 0 &&
-      profile.multiResultReductionElementBits > 0 &&
-      profile.multiResultReductionPaddedAxisExtent > 0) {
-    for (const auto &[shape, count] :
-         work.scalarizedMultiResultReductionCounts) {
-      const int64_t rows = std::get<0>(shape);
-      const int64_t extent = std::get<1>(shape);
-      const int64_t results = std::get<2>(shape);
-      const int64_t bits = std::get<3>(shape);
-      if (count <= 0.0 || rows <= 0 || extent <= 0 ||
-          results != profile.multiResultReductionResultCount ||
-          bits != profile.multiResultReductionElementBits ||
-          llvm::PowerOf2Ceil(static_cast<uint64_t>(extent)) !=
-              static_cast<uint64_t>(
-                  profile.multiResultReductionPaddedAxisExtent))
-        continue;
-      const llvm::StringRef tailClass = multiResultReductionTailClass(extent);
-      auto curve =
-          profile.multiResultReductionGroupCyclesByTailClassAndRows.find(
-              tailClass.str());
-      if (curve ==
-          profile.multiResultReductionGroupCyclesByTailClassAndRows.end())
-        continue;
-      auto body = lookupBoundedCeilingGroupCost(curve->second, rows);
-      if (body)
-        resources.multiResultReductionGroupBody += count * *body;
+        simd && profile.reductionLaneStepsPerCycle > 0.0
+            ? simdReductionStartupOwners *
+                      profile.reductionOperationSetupCycles +
+                  work.shuffleLaneSteps / profile.reductionLaneStepsPerCycle
+            : work.shuffleLaneSteps / profile.shuffleLanesPerCycle;
+    if (simd && profile.scalarizedMultiResultReductionMinimumExtent > 0 &&
+        profile.scalarizedMultiResultReductionReferenceResults > 0 &&
+        profile.scalarizedMultiResultReductionElementsPerCycle > 0.0) {
+      for (const auto &[shape, count] :
+           work.scalarizedMultiResultReductionCounts) {
+        const int64_t rows = std::get<0>(shape);
+        const int64_t extent = std::get<1>(shape);
+        const int64_t results = std::get<2>(shape);
+        const int64_t bits = std::get<3>(shape);
+        if (count <= 0.0 ||
+            extent < profile.scalarizedMultiResultReductionMinimumExtent ||
+            results < profile.scalarizedMultiResultReductionReferenceResults ||
+            bits != 32)
+          continue;
+        const double resultScale =
+            static_cast<double>(results) /
+            profile.scalarizedMultiResultReductionReferenceResults;
+        resources.scalarizedMultiResultReduction +=
+            count *
+            (profile.scalarizedMultiResultReductionSetupCycles +
+             static_cast<double>(rows) * extent * resultScale /
+                 profile.scalarizedMultiResultReductionElementsPerCycle);
+      }
+      // The scalar loop is the concrete lowering of the same semantic reduction
+      // already priced above.
+      resources.reduction = std::max(resources.reduction,
+                                     resources.scalarizedMultiResultReduction);
     }
-  }
-  if (simd && profile.sortMinimumExtent > 0 &&
-      profile.sortMaximumExtent >= profile.sortMinimumExtent &&
-      profile.sortElementBits > 0 && profile.sortRowsPerCycle > 0.0) {
-    for (const auto &[shape, count] : work.sortCounts) {
-      const int64_t rows = std::get<0>(shape);
-      const int64_t extent = std::get<1>(shape);
-      const int64_t bits = std::get<2>(shape);
-      if (count <= 0.0 || extent < profile.sortMinimumExtent ||
-          extent > profile.sortMaximumExtent || bits != profile.sortElementBits)
-        continue;
-      resources.sort +=
-          count * (profile.sortSetupCycles + rows / profile.sortRowsPerCycle);
-    }
-    // ascend.sort previously contributed only to the generic issue floor.
-    resources.compute += resources.sort;
-  }
-  if (simd && !work.oneTripMaskedAccumulatorReductionExtents.empty()) {
-    resources.maskedAccumulatorReductionCompletionSetup =
-        profile.maskedAccumulatorReductionCompletionSetupCycles;
-    resources.setup += resources.maskedAccumulatorReductionCompletionSetup;
-  }
-  if (!simd && wholeSimt && profile.rowwiseReductionGroupBaseWarpCount > 0 &&
-      profile.activeWarpCount ==
-          profile.rowwiseReductionGroupBaseWarpCount * superblockFactor) {
-    const auto exactOperations =
-        exactNonNegativeWorkCount(work.reductionOperations);
-    const auto additionalSurface =
-        exactOperations
-            ? profile.rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent
-                  .find(*exactOperations)
-            : profile.rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent
-                  .end();
-    const auto *surfaces =
-        additionalSurface !=
-                profile
-                    .rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent
-                    .end()
-            ? &additionalSurface->second
-            : &profile.rowwiseReductionGroupCyclesByFactorRowsAndExtent;
-    const int64_t referenceOperations =
-        additionalSurface !=
-                profile
-                    .rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent
-                    .end()
-            ? additionalSurface->first
-            : profile.rowwiseReductionGroupReferenceOperations;
-    auto geometry = rowwiseReductionGeometry(stage, work, referenceOperations);
-    auto factorSurface = surfaces->find(superblockFactor);
-    if (geometry && factorSurface != surfaces->end()) {
-      auto body = interpolateBoundedRowExtentSurface(
-          factorSurface->second, geometry->first, geometry->second);
-      if (body)
-        resources.rowwiseReductionGroupBody = *body;
-    }
-  }
-  if (!simd && stage.costModelKind == StageCostModelKind::RowwiseReduction &&
-      resources.rowwiseReductionGroupBody == 0.0) {
-    // The generic shuffleLaneSteps workload counts source lanes at every
-    // reduction level.
-    std::optional<std::pair<int64_t, int64_t>> geometry;
-    if (work.reductionGeometryCounts.size() == 1) {
-      const auto &[shape, count] = *work.reductionGeometryCounts.begin();
-      if (std::get<2>(shape) == 32 && std::get<0>(shape) > 0 &&
-          std::get<1>(shape) > 1 && count > 0.0)
-        geometry = std::make_pair(std::get<0>(shape), std::get<1>(shape));
-    }
-    if (!geometry) {
-      const auto exactOperations =
-          exactNonNegativeWorkCount(work.reductionOperations);
-      if (exactOperations)
-        geometry = rowwiseReductionGeometry(stage, work, *exactOperations);
-    }
-    if (geometry) {
-      const int64_t rows = geometry->first;
-      const int64_t extent = geometry->second;
-      const int64_t warpWidth = 32;
-      auto add = profile.operationRates.find("f32.add");
-      if (rows > 0 && extent > 1 && add != profile.operationRates.end() &&
-          add->second.throughput > 0.0 && profile.shuffleLanesPerCycle > 0.0) {
-        const double scalarReductionOps = work.reductionOperations *
-                                          static_cast<double>(rows) *
-                                          static_cast<double>(extent - 1);
-        resources.reduction =
-            scalarReductionOps / add->second.throughput * add->second.factor;
-
-        const int64_t participatingLanes = std::min(extent, warpWidth);
-        int64_t shuffleDepth = 0;
-        for (int64_t lanes = participatingLanes; lanes > 1;
-             lanes = llvm::divideCeil(lanes, int64_t(2)))
-          ++shuffleDepth;
-        const double shuffleIssue =
-            work.reductionOperations * static_cast<double>(rows) *
-            static_cast<double>(participatingLanes - 1) /
-            profile.shuffleLanesPerCycle;
-        const double shuffleDependency = work.reductionOperations *
-                                         static_cast<double>(shuffleDepth) *
-                                         profile.prefixScanStepLatencyCycles;
-        resources.shuffle = std::max(shuffleIssue, shuffleDependency);
+    if (!calibratedReduction && !simd && wholeSimt && superblockFactor == 1 &&
+        profile.multiResultReductionGroupBaseWarpCount > 0 &&
+        profile.activeWarpCount ==
+            profile.multiResultReductionGroupBaseWarpCount * superblockFactor &&
+        profile.multiResultReductionResultCount > 0 &&
+        profile.multiResultReductionElementBits > 0 &&
+        profile.multiResultReductionPaddedAxisExtent > 0) {
+      for (const auto &[shape, count] :
+           work.scalarizedMultiResultReductionCounts) {
+        const int64_t rows = std::get<0>(shape);
+        const int64_t extent = std::get<1>(shape);
+        const int64_t results = std::get<2>(shape);
+        const int64_t bits = std::get<3>(shape);
+        if (count <= 0.0 || rows <= 0 || extent <= 0 ||
+            results != profile.multiResultReductionResultCount ||
+            bits != profile.multiResultReductionElementBits ||
+            llvm::PowerOf2Ceil(static_cast<uint64_t>(extent)) !=
+                static_cast<uint64_t>(
+                    profile.multiResultReductionPaddedAxisExtent))
+          continue;
+        const llvm::StringRef tailClass = multiResultReductionTailClass(extent);
+        auto curve =
+            profile.multiResultReductionGroupCyclesByTailClassAndRows.find(
+                tailClass.str());
+        if (curve ==
+            profile.multiResultReductionGroupCyclesByTailClassAndRows.end())
+          continue;
+        auto body = lookupBoundedCeilingGroupCost(curve->second, rows);
+        if (body)
+          resources.multiResultReductionGroupBody += count * *body;
       }
     }
+    if (simd && profile.sortMinimumExtent > 0 &&
+        profile.sortMaximumExtent >= profile.sortMinimumExtent &&
+        profile.sortElementBits > 0 && profile.sortRowsPerCycle > 0.0) {
+      for (const auto &[shape, count] : work.sortCounts) {
+        const int64_t rows = std::get<0>(shape);
+        const int64_t extent = std::get<1>(shape);
+        const int64_t bits = std::get<2>(shape);
+        if (count <= 0.0 || extent < profile.sortMinimumExtent ||
+            extent > profile.sortMaximumExtent ||
+            bits != profile.sortElementBits)
+          continue;
+        resources.sort +=
+            count * (profile.sortSetupCycles + rows / profile.sortRowsPerCycle);
+      }
+      // ascend.sort previously contributed only to the generic issue floor.
+      resources.compute += resources.sort;
+    }
+    if (simd && !work.oneTripMaskedAccumulatorReductionExtents.empty()) {
+      resources.maskedAccumulatorReductionCompletionSetup =
+          profile.maskedAccumulatorReductionCompletionSetupCycles;
+      resources.setup += resources.maskedAccumulatorReductionCompletionSetup;
+    }
+    if (!calibratedReduction && !simd && wholeSimt &&
+        profile.rowwiseReductionGroupBaseWarpCount > 0 &&
+        profile.activeWarpCount ==
+            profile.rowwiseReductionGroupBaseWarpCount * superblockFactor) {
+      const auto exactOperations =
+          exactNonNegativeWorkCount(work.reductionOperations);
+      const auto additionalSurface =
+          exactOperations
+              ? profile
+                    .rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent
+                    .find(*exactOperations)
+              : profile
+                    .rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent
+                    .end();
+      const auto *surfaces =
+          additionalSurface !=
+                  profile
+                      .rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent
+                      .end()
+              ? &additionalSurface->second
+              : &profile.rowwiseReductionGroupCyclesByFactorRowsAndExtent;
+      const int64_t referenceOperations =
+          additionalSurface !=
+                  profile
+                      .rowwiseReductionGroupCyclesByOperationFactorRowsAndExtent
+                      .end()
+              ? additionalSurface->first
+              : profile.rowwiseReductionGroupReferenceOperations;
+      auto geometry =
+          rowwiseReductionGeometry(stage, work, referenceOperations);
+      auto factorSurface = surfaces->find(superblockFactor);
+      if (geometry && factorSurface != surfaces->end()) {
+        auto body = interpolateBoundedRowExtentSurface(
+            factorSurface->second, geometry->first, geometry->second);
+        if (body)
+          resources.rowwiseReductionGroupBody = *body;
+      }
+    }
+    if (!simd && stage.costModelKind == StageCostModelKind::RowwiseReduction &&
+        resources.rowwiseReductionGroupBody == 0.0) {
+      // The generic shuffleLaneSteps workload counts source lanes at every
+      // reduction level.
+      std::optional<std::pair<int64_t, int64_t>> geometry;
+      if (work.reductionGeometryCounts.size() == 1) {
+        const auto &[shape, count] = *work.reductionGeometryCounts.begin();
+        if (std::get<2>(shape) == 32 && std::get<0>(shape) > 0 &&
+            std::get<1>(shape) > 1 && count > 0.0)
+          geometry = std::make_pair(std::get<0>(shape), std::get<1>(shape));
+      }
+      if (!geometry && !calibratedReduction) {
+        const auto exactOperations =
+            exactNonNegativeWorkCount(work.reductionOperations);
+        if (exactOperations)
+          geometry = rowwiseReductionGeometry(stage, work, *exactOperations);
+      }
+      if (geometry) {
+        const int64_t rows = geometry->first;
+        const int64_t extent = geometry->second;
+        const int64_t warpWidth = 32;
+        auto add = profile.operationRates.find("f32.add");
+        if (rows > 0 && extent > 1 && add != profile.operationRates.end() &&
+            add->second.throughput > 0.0 &&
+            profile.shuffleLanesPerCycle > 0.0) {
+          const double scalarReductionOps = work.reductionOperations *
+                                            static_cast<double>(rows) *
+                                            static_cast<double>(extent - 1);
+          resources.reduction =
+              scalarReductionOps / add->second.throughput * add->second.factor;
+
+          const int64_t participatingLanes = std::min(extent, warpWidth);
+          int64_t shuffleDepth = 0;
+          for (int64_t lanes = participatingLanes; lanes > 1;
+               lanes = llvm::divideCeil(lanes, int64_t(2)))
+            ++shuffleDepth;
+          const double shuffleIssue =
+              work.reductionOperations * static_cast<double>(rows) *
+              static_cast<double>(participatingLanes - 1) /
+              profile.shuffleLanesPerCycle;
+          const double shuffleDependency = work.reductionOperations *
+                                           static_cast<double>(shuffleDepth) *
+                                           profile.prefixScanStepLatencyCycles;
+          resources.shuffle = std::max(shuffleIssue, shuffleDependency);
+        }
+      }
+    }
+    if (stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence &&
+        stage.features.hasReduction && work.shuffleLaneSteps > 0.0) {
+      auto factorCurve =
+          profile.recurrenceReductionGroupCyclesByFactorAndLaneSteps.find(
+              superblockFactor);
+      if (factorCurve !=
+          profile.recurrenceReductionGroupCyclesByFactorAndLaneSteps.end())
+        resources.recurrenceGroupCriticalPath = interpolateOperationCost(
+            factorCurve->second,
+            static_cast<int64_t>(std::ceil(work.shuffleLaneSteps)));
+      auto startupCurve =
+          profile.recurrenceReductionGroupStartupCyclesByFactorAndLaneSteps
+              .find(superblockFactor);
+      if (startupCurve !=
+          profile.recurrenceReductionGroupStartupCyclesByFactorAndLaneSteps
+              .end())
+        resources.recurrenceGroupStartup = interpolateOperationCost(
+            startupCurve->second,
+            static_cast<int64_t>(std::ceil(work.shuffleLaneSteps)));
+    }
   }
-  if (stage.costModelKind == StageCostModelKind::LoopCarriedRecurrence &&
-      stage.features.hasReduction && work.shuffleLaneSteps > 0.0) {
-    auto factorCurve =
-        profile.recurrenceReductionGroupCyclesByFactorAndLaneSteps.find(
-            superblockFactor);
-    if (factorCurve !=
-        profile.recurrenceReductionGroupCyclesByFactorAndLaneSteps.end())
-      resources.recurrenceGroupCriticalPath = interpolateOperationCost(
-          factorCurve->second,
-          static_cast<int64_t>(std::ceil(work.shuffleLaneSteps)));
-    auto startupCurve =
-        profile.recurrenceReductionGroupStartupCyclesByFactorAndLaneSteps.find(
-            superblockFactor);
-    if (startupCurve !=
-        profile.recurrenceReductionGroupStartupCyclesByFactorAndLaneSteps.end())
-      resources.recurrenceGroupStartup = interpolateOperationCost(
-          startupCurve->second,
-          static_cast<int64_t>(std::ceil(work.shuffleLaneSteps)));
-  }
+  if (calibratedReduction && work.reductionOperations > 0.0)
+    resources.reduction += *calibratedReduction;
   if (work.dotFlops > 0.0) {
     // A Stage can own multiple tiny dots.
     resources.dot = work.dotOperations * profile.dotSetupCycles +
@@ -2160,8 +2482,114 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
     // old flat-throughput bound without charging those bytes a second time.
     resources.store = std::max(resources.store, resources.storeLayoutService);
   }
-  mapMaskedStridedCopyCompletion(stage, work, profile, resources);
+  mapMaskedStridedCopyCompletion(stage, work, profile, resources,
+                                 stridedShortAlreadyClaimed);
   return materializeControlFlow(stage, mode, resources, profile.controlFlow);
+}
+
+// The calibration prices one reduction window, not an entire Stage body.
+struct OrdinaryReductionMapping {
+  StageResourceCycles resources;
+  bool first = false, middle = false, tail = false;
+  double fallbackInstances = 0;
+  std::map<std::string, double> fittedInstances;
+};
+static llvm::Expected<std::optional<OrdinaryReductionMapping>>
+mapOrdinaryReduction(const LogicalStage &stage,
+                     const StageImplementation &implementation,
+                     const HardwareProfile &hardware,
+                     const StageModeProfile &modeProfile,
+                     const StageResourceCycles &legacy,
+                     const StageMemoryCost &fitted) {
+  if (!hardware.reductionProfile || !stage.reductionExternalWorkload ||
+      implementation.aivSubblocks != 1 ||
+      stage.costModelKind != StageCostModelKind::RowwiseReduction ||
+      legacy.rowwiseReductionGroupBody > 0 ||
+      legacy.multiResultReductionGroupBody > 0 ||
+      !stage.workload.scalarizedMultiResultReductionCounts.empty() ||
+      !stage.workload.oneTripMaskedAccumulatorReductionExtents.empty() ||
+      !stage.workload.prefixScanCounts.empty() ||
+      stage.workload.reductionWorkloads.empty())
+    return std::nullopt;
+  OrdinaryReductionMapping result;
+  double cycles = 0, occurrences = 0;
+  LogicalStage residual = stage;
+  residual.workload = *stage.reductionExternalWorkload;
+  auto mode = implementation.mode == StageMode::SIMD ? ReductionMode::SIMD
+                                                     : ReductionMode::SIMT;
+  const bool decomposed = !stage.reductionContributions.empty();
+  const auto consume =
+      [&](const ReductionWorkload &work,
+          const StageWorkload *contribution) -> llvm::Expected<bool> {
+    occurrences += work.instances;
+    auto estimated = estimateReductionCycles(work, *hardware.reductionProfile,
+                                             mode, hardware.baseSimtWarpCount);
+    if (!estimated)
+      return estimated.takeError();
+    const auto &estimate = *estimated;
+    if (!estimate) {
+      if (!contribution)
+        return false;
+      mergeReductionResidualWorkload(residual.workload, *contribution);
+      result.fallbackInstances += work.instances;
+      return true;
+    }
+    cycles += work.instances * estimate->cycles;
+    std::string family = estimate->axis == ReductionAxisKind::First ? "first"
+                         : estimate->axis == ReductionAxisKind::Middle
+                             ? "middle"
+                             : "tail";
+    result.fittedInstances[family + "/" + work.kind + "/" + work.dataType] +=
+        work.instances;
+    result.first |= estimate->axis == ReductionAxisKind::First;
+    result.middle |= estimate->axis == ReductionAxisKind::Middle;
+    result.tail |= estimate->axis == ReductionAxisKind::Tail;
+    return true;
+  };
+  if (decomposed) {
+    for (const auto &contribution : stage.reductionContributions) {
+      if (contribution.reductionWorkloads.size() != 1 ||
+          std::abs(contribution.reductionOperations -
+                   contribution.reductionWorkloads.front().instances) > 1e-9)
+        return std::nullopt;
+      auto consumed =
+          consume(contribution.reductionWorkloads.front(), &contribution);
+      if (!consumed)
+        return consumed.takeError();
+      if (!*consumed)
+        return std::nullopt;
+    }
+  } else {
+    // Hand-built/native stages retain their former all-supported compatibility.
+    // Their external snapshot can still contain semantic reduction roots.
+    for (const auto &work : stage.workload.reductionWorkloads) {
+      auto consumed = consume(work, nullptr);
+      if (!consumed)
+        return consumed.takeError();
+      if (!*consumed)
+        return std::nullopt;
+    }
+    residual.workload.reductionOperations = 0;
+    residual.workload.shuffleLaneSteps = 0;
+    residual.workload.reductionWorkloads.clear();
+    residual.workload.reductionGeometryCounts.clear();
+    residual.workload.reductionCombineClassCounts.clear();
+  }
+  if (!(result.first || result.middle || result.tail) ||
+      !std::isfinite(cycles) ||
+      std::abs(occurrences - stage.workload.reductionOperations) > 1e-9)
+    return std::nullopt;
+  // Avoid deriving residual reduction geometry from the full Stage's input
+  // load. The residual reductionGeometryCounts are authoritative when present.
+  auto mapped = mapWorkload(residual, modeProfile, implementation.mode,
+                            implementation.superblockFactor,
+                            implementation.mode == StageMode::SIMT &&
+                                !implementation.localScope,
+                            cycles, fitted);
+  if (!mapped)
+    return std::nullopt;
+  result.resources = *mapped;
+  return result;
 }
 
 /// Balanced CV tensor partition on one AIV.
@@ -2343,6 +2771,7 @@ static double applySuperBlock(const LogicalStage &stage,
        stage.costModelKind == StageCostModelKind::ContinuousShortLoad ||
        stage.costModelKind == StageCostModelKind::CachePolicyStore ||
        stage.costModelKind == StageCostModelKind::IndirectScalarMemory ||
+       stage.costModelKind == StageCostModelKind::PartialContinuousTileMemory ||
        stage.costModelKind == StageCostModelKind::IndirectGatherMemory) &&
       (resources.continuousLoadGroup > 0.0 ||
        resources.continuousStoreGroup > 0.0 ||
@@ -2609,6 +3038,8 @@ llvm::StringRef mlir::ascend::stringifyStageCostModel(StageCostModelKind kind) {
     return "loop_predicate";
   case StageCostModelKind::ContinuousTileMemory:
     return "continuous_tile_memory";
+  case StageCostModelKind::PartialContinuousTileMemory:
+    return "partial_continuous_tile_memory";
   case StageCostModelKind::ContinuousTileStore:
     return "continuous_tile_store";
   case StageCostModelKind::ContinuousShortLoad:
@@ -3369,12 +3800,32 @@ bool StageModeProfile::isValid(StageMode mode) const {
 }
 
 bool HardwareProfile::isValid() const {
-  return !profileVersion.empty() && !target.empty() && baseSimtWarpCount > 0 &&
+  return baseSimtWarpCount > 0 &&
          (cvAivSubblocks == 1 || cvAivSubblocks == 2) &&
          maximumSimtEstimationFactor >= 1 &&
          maximumSimtEstimationFactor <= 64 &&
          (maximumSimtEstimationFactor & (maximumSimtEstimationFactor - 1)) ==
              0 &&
+         !profileVersion.empty() && !target.empty() &&
+         (simtIndirectLoadModel.empty() ||
+          ((simtIndirectLoadModel == "unmasked_complete_factor_20261020" ||
+            simtIndirectLoadModel == "prefix_mask_rank_factor_20261017" ||
+            simtIndirectLoadModel == "random_mask_rank_factor_20261017") &&
+           target == "Ascend950PR/dav-c310")) &&
+         (simdIndirectLoadModel.empty() ||
+          ((simdIndirectLoadModel == "random_dtype_matched_ab_20261008" ||
+            simdIndirectLoadModel == "simd_mask_envelope_20261019") &&
+           target == "Ascend950PR/dav-c310")) &&
+         (simtIndirectStoreModel.empty() ||
+          ((simtIndirectStoreModel == "unmasked_complete_factor_20261020" ||
+            simtIndirectStoreModel == "prefix_mask_rank_factor_20261017" ||
+            simtIndirectStoreModel == "random_mask_rank_factor_20261017") &&
+           target == "Ascend950PR/dav-c310")) &&
+         (simdIndirectStoreModel.empty() ||
+          ((simdIndirectStoreModel == "random_store_no_fill_first_20261008" ||
+            simdIndirectStoreModel == "random_store_no_fill_reuse_20261008" ||
+            simdIndirectStoreModel == "simd_mask_envelope_20261019") &&
+           target == "Ascend950PR/dav-c310")) &&
          logicalWarpGroupCount > 0 && superblockUsefulFactorLimit > 0 &&
          superblockPersistentStatePressureFreeFactor > 0 &&
          superblockPersistentStatePressureFreeFactor <=
@@ -3563,15 +4014,45 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
               stage.workload.dotFlops > 0.0);
       const LogicalStage executionStage =
           perAivStage(stage, implementation.aivSubblocks);
+      const StageMemoryCost fitted = IndirectGatherMemoryCostModel().cost(
+          executionStage, profile, implementation);
       std::optional<StageResourceCycles> resources = mapWorkload(
           executionStage, modeProfile, implementation.mode,
           implementation.superblockFactor,
-          implementation.mode == StageMode::SIMT && !implementation.localScope);
+          implementation.mode == StageMode::SIMT && !implementation.localScope,
+          std::nullopt, fitted);
       if (!resources)
         continue;
+      auto mapping =
+          mapOrdinaryReduction(executionStage, implementation, profile,
+                               modeProfile, *resources, fitted);
+      if (!mapping)
+        return mapping.takeError();
+      const auto &calibrated = *mapping;
+      if (calibrated)
+        resources = calibrated->resources;
       StageImplementationCost cost;
       cost.implementation = implementation;
+      cost.calibratedTailReduction = calibrated && calibrated->tail;
+      cost.calibratedFirstReduction = calibrated && calibrated->first;
+      cost.calibratedMiddleReduction = calibrated && calibrated->middle;
+      cost.reductionFallbackInstances =
+          calibrated ? calibrated->fallbackInstances : 0;
+      if (calibrated)
+        cost.fittedReductionInstances = calibrated->fittedInstances;
       cost.resources = *resources;
+      if (fitted.load)
+        cost.indirectLoadPricing = implementation.mode == StageMode::SIMD
+                                       ? profile.simdIndirectLoadModel
+                                       : profile.simtIndirectLoadModel;
+      if (fitted.store)
+        cost.indirectStorePricing = implementation.mode == StageMode::SIMD
+                                        ? profile.simdIndirectStoreModel
+                                        : profile.simtIndirectStoreModel;
+      if (fitted.loadPricing)
+        cost.indirectLoadPricing = fitted.loadPricing;
+      if (fitted.storePricing)
+        cost.indirectStorePricing = fitted.storePricing;
       if (implementation.aivSubblocks > 1)
         cost.perAivWorkload = executionStage.workload;
       if (resources->recurrenceGroupCriticalPath > 0.0 ||
@@ -3606,6 +4087,8 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
         cost.formulaEvidence = "uncalibrated_superblock_fallback";
       else
         cost.formulaEvidence = "analytical_resource_formula";
+      if (fitted.load || fitted.store)
+        cost.formulaEvidence = "matched_ab_indirect_memory_increment";
       if (resources->indirectMemoryAnalyticalFallback &&
           cost.formulaEvidence.find(
               "analytical_indirect_memory_resource_fallback") ==
@@ -3628,6 +4111,12 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
       if (!stage.workload.segmentedIndirectStoreCounts.empty() &&
           resources->indirectMemoryAnalyticalFallback)
         cost.formulaEvidence += "+segmented_indirect_store_analytical_fallback";
+      if (cost.calibratedTailReduction)
+        cost.formulaEvidence += "+calibrated_tail_reduction_window";
+      if (cost.calibratedMiddleReduction)
+        cost.formulaEvidence += "+calibrated_middle_reduction_window";
+      if (cost.calibratedFirstReduction)
+        cost.formulaEvidence += "+calibrated_first_reduction_window";
       if (resources->scalarizedMultiResultReduction > 0.0)
         cost.formulaEvidence += "+scalarized_multi_result_reduction_surface";
       if (resources->multiResultReductionGroupBody > 0.0)
@@ -3728,6 +4217,18 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
           applySuperBlock(executionStage, *resources, implementation, profile,
                           estimateStage(executionStage, profile,
                                         implementation.mode, *resources));
+      if (fitted.nativeSimdEnvelope)
+        cost.formulaEvidence += "+native_simd_target_loop_completion";
+      if (fitted.densityRange) {
+        auto upper = *resources;
+        (fitted.store ? upper.store : upper.load) +=
+            fitted.densityRange->second - fitted.densityRange->first;
+        const double high = applySuperBlock(
+            executionStage, upper, implementation, profile,
+            estimateStage(executionStage, profile, implementation.mode, upper));
+        cost.totalCycles = (cost.totalCycles + high) / 2;
+        cost.formulaEvidence += "+stage_density_range_midpoint";
+      }
       if (implementation.aivSubblocks > 1) {
         cost.cvPartitionIdealTotalCycles = cost.totalCycles;
         cost.cvPartitionPayloadEfficiency =

@@ -410,22 +410,24 @@ def _auto_simt_asset_hash(path: str, default_name: str) -> str:
     digest.update(selection_bytes)
     try:
         profile = json.loads(selection_bytes)
-        shared_ref = (profile.get("microbenchmark_profile") if isinstance(profile, dict) else None)
     except (TypeError, ValueError, UnicodeError):
-        shared_ref = None
-    if shared_ref is not None and not isinstance(shared_ref, str):
-        digest.update(b"\0invalid-shared-microbenchmark-reference\0")
-        digest.update(repr(shared_ref).encode())
-        return digest.hexdigest()
-    if shared_ref:
-        shared_asset = Path(shared_ref)
-        if not shared_asset.is_absolute():
-            shared_asset = asset.parent / shared_asset
-        digest.update(b"\0shared-microbenchmark\0")
+        profile = {}
+    for key, label in [("microbenchmark_profile", b"shared-microbenchmark"),
+                       ("indirect_memory_profile", b"indirect-memory"), ("reduction_profile", b"reduction-profile")]:
+        reference = profile.get(key) if isinstance(profile, dict) else None
+        if reference is None:
+            continue
+        digest.update(b"\0" + label + b"\0")
+        if not isinstance(reference, str) or not reference:
+            digest.update(b"invalid-reference\0" + repr(reference).encode())
+            continue
+        dependency = Path(reference)
+        if not dependency.is_absolute():
+            dependency = asset.parent / dependency
         try:
-            digest.update(shared_asset.read_bytes())
+            digest.update(dependency.read_bytes())
         except OSError:
-            digest.update(f"missing:{shared_asset}".encode())
+            digest.update(f"missing:{dependency}".encode())
     return digest.hexdigest()
 
 
@@ -1773,6 +1775,16 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
     return metadata
 
 
+def _parse_float_env(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
     bishengir_target_opt = f"--target={bishengir_target}"
@@ -2087,7 +2099,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += [f"--enable-vf-merge-level={vf_merge_level}"]
 
         hfusion_enable_multiple_consumer_fusion = metadata["hfusion_enable_multiple_consumer_fusion"]
-        if hfusion_enable_multiple_consumer_fusion is not None:
+        if hfusion_enable_multiple_consumer_fusion:
             _compile_option_list += [
                 f"--hfusion-enable-multiple-consumer-fusion={hfusion_enable_multiple_consumer_fusion}"
             ]

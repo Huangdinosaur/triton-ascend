@@ -7,6 +7,7 @@
 #ifndef ASCENDMODEL_ROUTEMODEL_STAGEROUTECOSTMODEL_H
 #define ASCENDMODEL_ROUTEMODEL_STAGEROUTECOSTMODEL_H
 
+#include "AscendModel/RouteModel/Reduction/ReductionWorkload.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -156,6 +157,8 @@ struct StageModelFeatures {
   bool hasPointerInduction = false;
   bool hasContiguousMemory = false;
   bool hasIndirectMemory = false;
+  /// Loaded-index outer axes with a proven unit-stride contiguous suffix.
+  bool hasPartialContinuousMemory = false;
   bool hasAtomicMemory = false;
   bool hasReduction = false;
   bool hasPrefixScan = false;
@@ -272,13 +275,44 @@ struct TensorOperationWorkload {
   llvm::json::Object toJSON() const;
 };
 
+/// TTIR-only address facts. The opt-in indirect-load fit uses these to check
+/// its calibrated domain, without altering Stage classification.
+/// A null stride/alignment means "not proven", not random.
+struct AddressAxisSummary {
+  int64_t extent = 0;
+  std::string offsetAxisInfo = "unknown";
+  std::string regularity = "opaque";
+  std::string provenance = "unknown";
+  std::optional<int64_t> knownStride;
+  bool hasUnknownComponent = true;
+  std::optional<int64_t> alignmentBytes;
+  std::string reason;
+
+  llvm::json::Object toJSON() const;
+};
+
+struct AddressPatternSummary {
+  int64_t ttirLoadOrdinal = -1;
+  std::string stageId;
+  std::string sourceLocation;
+  std::string memoryOp;
+  std::string patternClass;
+  bool dependsOnLoadedValue = false;
+  std::vector<AddressAxisSummary> axes;
+
+  llvm::json::Object toJSON() const;
+};
+
 /// Mode-independent work owned exactly once by one Stage.  Values are
 /// logical elements/bytes, not mode-specific instructions or cycles.
 struct StageWorkload {
+  std::vector<ReductionWorkload> reductionWorkloads;
   // Element count of one operation -> dynamic occurrences per Stage iteration.
   // Keep operation boundaries until mode-specific lane rounding is applied.
   llvm::StringMap<std::map<int64_t, double>> operationCounts;
   std::vector<TensorOperationWorkload> tensorOperationWorkloads;
+  /// Per-op address summaries, not multiplied by loop trips.
+  std::vector<AddressPatternSummary> addressPatterns;
   double scalarOperations = 0.0;
   double loadBytes = 0.0;
   double storeBytes = 0.0;
@@ -288,6 +322,27 @@ struct StageWorkload {
   double storeOperations = 0.0;
   double loadWarpInstructions = 0.0;
   double storeWarpInstructions = 0.0;
+  /// Subsets of the total load/store fields whose address depends on loaded
+  /// data (or is an explicit gather).  Keeping totals and subsets preserves
+  /// report compatibility while allowing direct and indirect work to be
+  /// priced independently.  Atomic RMW work is never included in store totals.
+  double indirectLoadBytes = 0.0;
+  double indirectStoreBytes = 0.0;
+  /// Evidence contract for the optional store reuse fit: the identical target
+  /// addresses were written at least twice without intervening state changes.
+  /// No current pointer analysis proves this; default false, never inferred
+  /// from loop iteration count, allocation, or a profile model name alone.
+  bool hasProvenIndirectStoreReuse = false;
+  double indirectLoadTransactions = 0.0;
+  double indirectStoreTransactions = 0.0;
+  /// Direct-memory work summed once per discrete contiguous row.  These are
+  /// subsets of the direct load/store totals, not additional resources.
+  double partialContinuousLoadRows = 0.0;
+  double partialContinuousStoreRows = 0.0;
+  double partialContinuousLoadBytes = 0.0;
+  double partialContinuousStoreBytes = 0.0;
+  double partialContinuousLoadWarpInstructions = 0.0;
+  double partialContinuousStoreWarpInstructions = 0.0;
   /// Lowering-provided generated vector traffic.
   double sharedLocalLoadInstructions = 0.0;
   double sharedLocalStoreInstructions = 0.0;
@@ -446,10 +501,15 @@ struct StageResourceCycles {
   /// Full-tile store service floor divided by F, like the analytical store
   /// resource. SuperBlock applies F once. Excludes first-round/sync costs.
   double storeLayoutService = 0.0;
+  /// Closed-form strided direct load/store completion claimed by
+  /// mapStridedShortMemoryCompletion.  Already included in load/store as a
+  /// separate receipt-owned term; diagnostic decomposition, not extra terms.
+  double stridedShortLoadCompletion = 0.0;
+  double stridedShortStoreCompletion = 0.0;
   double criticalPath = 0.0;
   bool indirectMemoryAnalyticalFallback = false;
 
-  std::array<std::pair<llvm::StringRef, double>, 51> keyedValues() const;
+  std::array<std::pair<llvm::StringRef, double>, 53> keyedValues() const;
   bool isFiniteAndNonNegative() const;
   llvm::json::Object toJSON() const;
   /// Preserve every non-zero resource while omitting default-valued
@@ -458,7 +518,14 @@ struct StageResourceCycles {
 };
 
 struct StageImplementationCost {
+  bool calibratedTailReduction = false;
+  bool calibratedFirstReduction = false;
+  bool calibratedMiddleReduction = false;
+  double reductionFallbackInstances = 0;
+  std::map<std::string, double> fittedReductionInstances;
   StageImplementation implementation;
+  std::string indirectLoadPricing = "generic_resource_model";
+  std::string indirectStorePricing = "generic_resource_model";
   double totalCycles = 0.0;
   /// A profiled semantic operation in this implementation already includes
   /// the fixed local-SIMT scope enter/exit completion envelope.
