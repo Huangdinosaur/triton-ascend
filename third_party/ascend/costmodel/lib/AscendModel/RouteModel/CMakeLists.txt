@@ -8,6 +8,7 @@ add_mlir_library(AscendModelRouteModel
   ../Analysis/SimtAnchorAnalysis.cpp
   ../Analysis/StagePartitioner.cpp
   ../Analysis/StageMemoryPatternAnalysis.cpp
+  ../Analysis/LoopWorkloadAnalysis.cpp
   ../Analysis/SimtRegisterPressureAnalysis.cpp
   Reduction/ReductionAnalysis.cpp
   Reduction/ReductionWorkload.cpp
@@ -34,6 +35,7 @@ add_mlir_library(AscendModelRouteModel
   AscendModelProfile
   TritonOffsetAnalysis
   TritonIR
+  MLIRArithDialect
   MLIRIR
   MLIRAnalysis
   MLIRPass
