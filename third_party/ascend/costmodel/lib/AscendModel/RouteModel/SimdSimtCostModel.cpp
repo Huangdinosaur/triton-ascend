@@ -3591,7 +3591,7 @@ static llvm::Expected<StageCostModelSummary> evaluateStageModel(
       }
       const auto &[geometry, count] = *stage.workload.prefixScanCounts.begin();
       const auto &[extent, sequences, stride, results, reverse, combine,
-                   dataType, rank, dimension] = geometry;
+                   dataType, rank, dimension, elementBits] = geometry;
       if (!std::isfinite(count) || std::abs(count - 1.0) > 1.0e-12 || reverse ||
           combine != "add" || results != 1 || stride != sequences ||
           extent < rank2ScanFit.minimumExtent ||

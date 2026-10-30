@@ -137,7 +137,7 @@ struct StageOperationRate {
   std::map<int64_t, double> throughputByWarpCount;
 };
 
-/// Forward f32 cumsum calibration in SYS_CNT cycles.
+/// Prefix scan calibration in SYS_CNT cycles.
 /// Applied independently to each scan geometry and occurrence.
 struct CalibratedPrefixScanProfile {
   bool enabled = false;

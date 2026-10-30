@@ -1438,13 +1438,10 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
                        interpolateEnvelopeCost(startupCurve, extent));
       }
     }
-    // Calibration applies to forward, single-result f32 addition.
-    // Price each geometry separately before multiplying its dynamic count.
+    // Apply the scan formulas independently of direction, combine and result
+    // count. Geometry and element width follow the first scan operand.
     const auto &calibration = profile.calibratedPrefixScan;
-    if (calibration.enabled && !reverse && resultCount == 1 &&
-        combineClass == "add" && std::get<6>(shape) == "f32" &&
-        std::get<7>(shape) > 0 && !stage.features.isGridStrideLoopShell &&
-        !stage.features.insideGridStrideLoopBody) {
+    if (calibration.enabled && std::get<7>(shape) > 0) {
       const double n = static_cast<double>(extent) * independentSequences;
       double completion = 0.0;
       if (simd && independentSequences == 1) {
@@ -1461,13 +1458,18 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
                        : calibration.prefixScanDependencyFactor1dTiledWork) /
                   64.0;
       } else if (simd) {
-        const double steps = extent * std::ceil(independentSequences / 64.0);
+        const int64_t elementBits = std::get<9>(shape);
+        const double elementBytes = elementBits >= 8 ? elementBits / 8 : 0;
+        const double vectorElements =
+            elementBytes > 0.0 ? 256.0 / elementBytes : 64.0;
+        const double steps =
+            extent * std::ceil(independentSequences / vectorElements);
         completion = calibration.prefixScanStartupCycles +
                      (steps * calibration.prefixScanDependencyFactor +
                       std::max(0.0, steps - 256.0) *
                           calibration.prefixScanDependencyFactorMultiTail) /
                          64.0;
-        if (std::get<8>(shape) != 0) {
+        if (std::get<8>(shape) != 0 && elementBytes > 0.0) {
           const bool rank2 = std::get<7>(shape) == 2;
           const double rate =
               rank2 ? calibration.prefixScanTransposeAr2raBytesPerCycle
@@ -1476,7 +1478,7 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
             completion +=
                 (rank2 ? calibration.prefixScanTransposeAr2raFixedCycles
                        : calibration.prefixScanTransposeDim01FixedCycles) +
-                2.0 * n * 4.0 / rate;
+                2.0 * n * elementBytes / rate;
         }
       } else if (independentSequences == 1 &&
                  !calibration.prefixScan1dWarpSegments.empty()) {
@@ -2793,15 +2795,12 @@ static LogicalStage perAivStage(const LogicalStage &logical, int64_t parts) {
   for (const auto &[elements, count] : work.predicateCounts)
     predicates[extent(elements)] += count;
   work.predicateCounts = std::move(predicates);
-  std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool, std::string,
-                      std::string, int64_t, int64_t>,
-           double>
-      scans;
+  decltype(work.prefixScanCounts) scans;
   for (const auto &[shape, count] : work.prefixScanCounts)
     scans[{std::get<0>(shape), extent(std::get<1>(shape)), std::get<2>(shape),
            std::get<3>(shape), std::get<4>(shape), std::get<5>(shape),
-           std::get<6>(shape), std::get<7>(shape), std::get<8>(shape)}] +=
-        count;
+           std::get<6>(shape), std::get<7>(shape), std::get<8>(shape),
+           std::get<9>(shape)}] += count;
   work.prefixScanCounts = std::move(scans);
   work.reductionOperations /= parts;
   work.shuffleLaneSteps /= parts;
@@ -3099,11 +3098,7 @@ static double estimateStageBase(const LogicalStage &stage,
         !(profile.simt.calibratedPrefixScan.enabled &&
           llvm::all_of(stage.workload.prefixScanCounts,
                        [](const auto &entry) {
-                         return !std::get<4>(entry.first) &&
-                                std::get<3>(entry.first) == 1 &&
-                                std::get<5>(entry.first) == "add" &&
-                                std::get<6>(entry.first) == "f32" &&
-                                std::get<7>(entry.first) > 0;
+                         return std::get<7>(entry.first) > 0;
                        })) &&
         profile.simt.straightLinePrefixScanElementsPerCycle > 0.0) {
       double semanticElements = 0.0;

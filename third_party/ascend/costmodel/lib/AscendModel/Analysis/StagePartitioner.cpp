@@ -777,8 +777,8 @@ static void accumulateReductionWorkload(Operation *operation,
           extent, independentSequences, axisStride,
           static_cast<int64_t>(operation->getNumResults()),
           reverse && reverse.getValue(), classifyScanCombine(operation),
-          typeToString(input.getElementType()), input.getRank(), dimension}] +=
-          1.0;
+          typeToString(input.getElementType()), input.getRank(), dimension,
+          getScalarBitWidth(input.getElementType())}] += 1.0;
     return;
   }
   const int64_t independentRows = input.getNumElements() / extent;

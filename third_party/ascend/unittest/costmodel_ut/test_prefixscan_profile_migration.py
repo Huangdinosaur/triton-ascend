@@ -173,13 +173,55 @@ def test_loop_scan_uses_same_calibration(tmp_path):
 
 @pytest.mark.parametrize('replacement', [('reverse = false', 'reverse = true'), ('arith.addf', 'arith.mulf'),
                                          ('f32', 'f16')])
-def test_unmeasured_scan_keeps_generic_model(tmp_path, replacement):
+def test_scan_calibration_ignores_direction_combine_and_dtype(tmp_path, replacement):
     profile, _, _ = local_profile(tmp_path)
     module = scan_module((128, ), 0).replace(*replacement)
     calibrated = evaluate(tmp_path, (128, ), profile=profile, module_text=module)
-    generic_profile = json.loads(profile.read_text())
-    generic_profile.pop('prefixscan_profile')
-    profile.write_text(json.dumps(generic_profile))
-    generic = evaluate(tmp_path, (128, ), profile=profile, module_text=module)
-    for mode in ('simd', 'simt'):
-        assert scan_costs(calibrated, mode) == pytest.approx(scan_costs(generic, mode))
+    assert scan_costs(calibrated, 'simd') == pytest.approx(316.821)
+    assert scan_costs(calibrated, 'simt') == pytest.approx(195.8)
+
+
+@pytest.mark.parametrize('dtype,bits', [('f16', 16), ('f32', 32), ('i32', 32), ('i64', 64)])
+@pytest.mark.parametrize('axis', [0, 1])
+def test_multidimensional_scan_uses_operand_width(tmp_path, dtype, bits, axis):
+    shape = (16, 128) if axis == 0 else (128, 16)
+    module = scan_module(shape, axis).replace('f32', dtype)
+    if dtype.startswith('i'):
+        module = module.replace('arith.addf', 'arith.addi')
+    report = evaluate(tmp_path, shape, axis=axis, module_text=module)
+    steps = {16: 16, 32: 32, 64: 64}[bits]
+    expected = 202.5 + steps * 573.6 / 64
+    if axis == 1:
+        expected += 323 + 2 * 2048 * (bits / 8) / 4.2
+    assert scan_costs(report, 'simd') == pytest.approx(expected)
+    instances = [
+        entry for stage in report['stage_model']['logical_stages']
+        for entry in stage['workload']['prefix_scan_instances_per_iteration']
+    ]
+    assert instances and all(entry['element_bit_width'] == bits for entry in instances)
+
+
+def test_mixed_scan_combines_keep_calibrated_cost(tmp_path):
+    module = scan_module((32, ), 0, copies=2).replace('arith.addf', 'arith.mulf', 1)
+    report = evaluate(tmp_path, (32, ), module_text=module)
+    assert scan_costs(report, 'simd') == pytest.approx(2 * (26.4 + 227.3 / 2))
+    assert scan_costs(report, 'simt') == pytest.approx(2 * 96.8)
+
+
+def test_multi_result_scan_uses_first_operand_geometry(tmp_path):
+    module = """module {
+      tt.func public @main(%input: tensor<32xf32>, %other: tensor<32xf32>)
+          -> (tensor<32xf32>, tensor<32xf32>) {
+        %scan:2 = "tt.scan"(%input, %other) ({
+        ^bb0(%a: f32, %b: f32, %c: f32, %d: f32):
+          %sum0 = arith.addf %a, %c : f32
+          %sum1 = arith.addf %b, %d : f32
+          "tt.scan.return"(%sum0, %sum1) : (f32, f32) -> ()
+        }) {axis = 0 : i32, reverse = false} :
+          (tensor<32xf32>, tensor<32xf32>) -> (tensor<32xf32>, tensor<32xf32>)
+        tt.return %scan#0, %scan#1 : tensor<32xf32>, tensor<32xf32>
+      }
+    }"""
+    report = evaluate(tmp_path, (32, ), module_text=module)
+    assert scan_costs(report, 'simd') == pytest.approx(26.4 + 227.3 / 2)
+    assert scan_costs(report, 'simt') == pytest.approx(96.8)
